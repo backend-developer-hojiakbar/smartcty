@@ -9,6 +9,7 @@ urlpatterns = [
     # Waste Bin URLs
     path('waste-bins/', views.WasteBinListCreateView.as_view(), name='waste-bin-list-create'),
     path('waste-bins/<str:pk>/', views.WasteBinDetailView.as_view(), name='waste-bin-detail'),
+    path('waste-bins/<str:pk>/update-image/', views.WasteBinImageUpdateView.as_view(), name='waste-bin-image-update'),
     path('waste-bins/hudud/<str:toza_hudud>/', views.get_waste_bins_by_hudud, name='waste-bins-by-hudud'),
     
     # Truck URLs

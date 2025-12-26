@@ -222,6 +222,8 @@ class WasteBinListCreateView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+# Exempt CSRF for API views that use token authentication
+@method_decorator(csrf_exempt, name='dispatch')
 class WasteBinDetailView(APIView):
     def get(self, request, pk):
         bin = get_object_or_404(WasteBin, pk=pk)
@@ -248,6 +250,21 @@ class WasteBinDetailView(APIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
+    def patch(self, request, pk):
+        bin = get_object_or_404(WasteBin, pk=pk)
+        
+        # Check if user has permission to access this bin
+        org_id = request.session.get('organization_id')
+        if org_id and str(bin.organization_id) != org_id:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Use partial=True to allow partial updates
+        serializer = WasteBinSerializer(bin, data=request.data, context={'request': request}, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
     def delete(self, request, pk):
         bin = get_object_or_404(WasteBin, pk=pk)
         
@@ -258,6 +275,44 @@ class WasteBinDetailView(APIView):
         
         bin.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class WasteBinImageUpdateView(APIView):
+    def patch(self, request, pk):
+        """Update only the image_url, is_full, fill_level, image_source, and last_analysis fields for a waste bin"""
+        bin = get_object_or_404(WasteBin, pk=pk)
+        
+        # Check if user has permission to access this bin
+        org_id = request.session.get('organization_id')
+        if org_id and str(bin.organization_id) != org_id:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Only allow updating specific fields
+        allowed_fields = ['image_url', 'is_full', 'fill_level', 'image_source', 'last_analysis']
+        update_data = {}
+        
+        for field in allowed_fields:
+            if field in request.data:
+                update_data[field] = request.data[field]
+        
+        # Set default image_source if not provided
+        if 'image_source' not in update_data:
+            update_data['image_source'] = 'BOT'
+        
+        # Set default last_analysis if not provided
+        if 'last_analysis' not in update_data:
+            update_data['last_analysis'] = 'Bot orqali yangilandi'
+        
+        # Update only the allowed fields
+        for field, value in update_data.items():
+            setattr(bin, field, value)
+        
+        bin.save()
+        
+        # Return the updated bin
+        serializer = WasteBinSerializer(bin)
+        return Response(serializer.data)
 
 
 class TruckListCreateView(APIView):

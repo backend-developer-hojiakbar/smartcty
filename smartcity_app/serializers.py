@@ -84,7 +84,8 @@ class OrganizationSerializer(serializers.ModelSerializer):
 
 
 class WasteBinSerializer(serializers.ModelSerializer):
-    location = CoordinateSerializer()
+    location = CoordinateSerializer(required=False)
+    organization = serializers.PrimaryKeyRelatedField(queryset=Organization.objects.all(), required=False)
 
     class Meta:
         model = WasteBin
@@ -97,13 +98,35 @@ class WasteBinSerializer(serializers.ModelSerializer):
         
         # The organization should be passed from the view context
         request = self.context.get('request')
-        if request and hasattr(request, 'user') and hasattr(request.user, 'organization'):
+        if request and hasattr(request, 'user') and hasattr(request, 'organization'):
             # If the user has an organization, assign it to the waste bin
             validated_data['organization'] = request.user.organization
             
         # Create the waste bin with the location
         waste_bin = WasteBin.objects.create(location=location, **validated_data)
         return waste_bin
+
+    def update(self, instance, validated_data):
+        # Handle location update if provided
+        location_data = validated_data.pop('location', None)
+        if location_data:
+            # Update the existing location coordinates
+            location = instance.location
+            for attr, value in location_data.items():
+                setattr(location, attr, value)
+            location.save()
+        
+        # Handle organization update if provided
+        organization = validated_data.pop('organization', None)
+        if organization:
+            instance.organization = organization
+        
+        # Update other fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        
+        instance.save()
+        return instance
 
 
 class TruckSerializer(serializers.ModelSerializer):

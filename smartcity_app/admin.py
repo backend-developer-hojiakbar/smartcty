@@ -49,7 +49,6 @@ class WasteBinAdmin(admin.ModelAdmin):
     list_filter = ['organization', 'is_full', 'fill_level']
     search_fields = ['address', 'id']
 
-
 @admin.register(Truck)
 class TruckAdmin(admin.ModelAdmin):
     list_display = ['id', 'organization', 'driver_name', 'plate_number', 'status']

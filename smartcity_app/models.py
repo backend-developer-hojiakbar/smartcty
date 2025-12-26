@@ -95,11 +95,11 @@ class WasteBin(models.Model):
     location = models.OneToOneField(Coordinate, on_delete=models.CASCADE)
     toza_hudud = models.CharField(max_length=50, default='1-sonli Toza Hudud')
     camera_url = models.URLField(blank=True, null=True)
-    google_maps_url = models.URLField()
+    google_maps_url = models.URLField(blank=True, null=True)
     fill_level = models.IntegerField(default=0)
     fill_rate = models.FloatField(default=1.5)
     last_analysis = models.CharField(max_length=200, default='Yangi qo\'shildi')
-    image_url = models.URLField()
+    image_url = models.URLField(blank=True, null=True)
     image_source = models.CharField(max_length=20, default='CCTV')
     is_full = models.BooleanField(default=False)
     device_health = models.JSONField(default=dict)
@@ -152,10 +152,10 @@ class MoistureSensor(models.Model):
 class Room(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=100)
-    target_temp = models.FloatField()
-    temperature = models.FloatField()
+    target_humidity = models.FloatField()
+    humidity = models.FloatField()
     status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
-    trend = models.JSONField()  # Stores temperature trend as a list of values
+    trend = models.JSONField()  # Stores humidity trend as a list of values
 
     def __str__(self):
         return self.name
@@ -164,10 +164,10 @@ class Room(models.Model):
 class Boiler(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=100)
-    target_temp = models.FloatField()
-    temperature = models.FloatField()
+    target_humidity = models.FloatField()
+    humidity = models.FloatField()
     status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
-    trend = models.JSONField()  # Stores temperature trend as a list of values
+    trend = models.JSONField()  # Stores humidity trend as a list of values
     device_health = models.OneToOneField(DeviceHealth, on_delete=models.CASCADE, related_name='boiler_health')
     connected_rooms = models.ManyToManyField(Room, related_name='boilers')
 
