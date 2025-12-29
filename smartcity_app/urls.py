@@ -10,7 +10,16 @@ urlpatterns = [
     path('waste-bins/', views.WasteBinListCreateView.as_view(), name='waste-bin-list-create'),
     path('waste-bins/<str:pk>/', views.WasteBinDetailView.as_view(), name='waste-bin-detail'),
     path('waste-bins/<str:pk>/update-image/', views.WasteBinImageUpdateView.as_view(), name='waste-bin-image-update'),
+    path('waste-bins/<str:pk>/update-camera-image/', views.update_bin_with_camera_image, name='waste-bin-camera-image-update'),
     path('waste-bins/hudud/<str:toza_hudud>/', views.get_waste_bins_by_hudud, name='waste-bins-by-hudud'),
+    
+    # IoT Device endpoints
+    path('iot-devices/', views.IoTDeviceListCreateView.as_view(), name='iot-device-list-create'),
+    path('iot-devices/data/update/', views.update_iot_sensor_data, name='iot-device-data-update'),
+    path('iot-devices/link-to-boiler/', views.link_iot_device_to_boiler, name='link-iot-device-to-boiler'),
+    path('iot-devices/link-to-room/', views.link_iot_device_to_room, name='link-iot-device-to-room'),
+    path('iot-devices/link-test/', views.iot_link_test, name='iot-link-test'),
+    path('iot-devices/<str:pk>/', views.IoTDeviceDetailView.as_view(), name='iot-device-detail'),
     
     # Truck URLs
     path('trucks/', views.TruckListCreateView.as_view(), name='truck-list-create'),

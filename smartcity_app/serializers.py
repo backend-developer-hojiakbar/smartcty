@@ -1,10 +1,11 @@
 from rest_framework import serializers
+from django.utils import timezone
 from .models import (
     User, Coordinate, Region, District, Organization, WasteBin, Truck, 
     MoistureSensor, Room, Boiler, Facility, AirSensor, SOSColumn, 
     EcoViolation, ConstructionMission, ConstructionSite, LightROI, 
     LightPole, Bus, ResponsibleOrg, CallRequest, CallRequestTimeline, 
-    Notification, ReportEntry, UtilityNode, DeviceHealth
+    Notification, ReportEntry, UtilityNode, DeviceHealth, IoTDevice
 )
 
 
@@ -34,7 +35,7 @@ class DistrictSerializer(serializers.ModelSerializer):
 class OrganizationSerializer(serializers.ModelSerializer):
     regionId = serializers.CharField(write_only=True, required=False)
     districtId = serializers.CharField(write_only=True, required=False)
-    center = CoordinateSerializer(read_only=True)
+    center = CoordinateSerializer(required=False)
 
     class Meta:
         model = Organization
@@ -81,29 +82,75 @@ class OrganizationSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({'districtId': 'District does not exist'})
         
         return super().to_internal_value(data)
+    
+    def create(self, validated_data):
+        # Handle center coordinate if provided
+        center_data = validated_data.pop('center', None)
+        if center_data:
+            center = Coordinate.objects.create(
+                lat=center_data['lat'],
+                lng=center_data['lng']
+            )
+            validated_data['center'] = center
+        
+        organization = Organization.objects.create(**validated_data)
+        return organization
+    
+    def update(self, instance, validated_data):
+        # Handle center coordinate if provided
+        center_data = validated_data.pop('center', None)
+        if center_data:
+            center = getattr(instance, 'center', None)
+            if center:
+                center.lat = center_data['lat']
+                center.lng = center_data['lng']
+                center.save()
+            else:
+                center = Coordinate.objects.create(
+                    lat=center_data['lat'],
+                    lng=center_data['lng']
+                )
+                instance.center = center
+        
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
 
 
 class WasteBinSerializer(serializers.ModelSerializer):
     location = CoordinateSerializer(required=False)
-    organization = serializers.PrimaryKeyRelatedField(queryset=Organization.objects.all(), required=False)
+    organization_id = serializers.CharField(write_only=True)
+    organization = OrganizationSerializer(read_only=True)
 
     class Meta:
         model = WasteBin
-        fields = '__all__'
+        fields = [
+            'id', 'organization', 'organization_id', 'address', 'location', 
+            'toza_hudud', 'camera_url', 'google_maps_url', 'fill_level', 
+            'fill_rate', 'last_analysis', 'image_url', 'image_source', 
+            'is_full', 'device_health', 'qr_code_url'
+        ]
+        read_only_fields = ['organization']
 
     def create(self, validated_data):
-        # Extract location data
+        # Extract location data and organization ID
         location_data = validated_data.pop('location')
-        location = Coordinate.objects.create(**location_data)
+        organization_id = validated_data.pop('organization_id')
         
-        # The organization should be passed from the view context
-        request = self.context.get('request')
-        if request and hasattr(request, 'user') and hasattr(request, 'organization'):
-            # If the user has an organization, assign it to the waste bin
-            validated_data['organization'] = request.user.organization
-            
-        # Create the waste bin with the location
-        waste_bin = WasteBin.objects.create(location=location, **validated_data)
+        # Get the organization instance
+        try:
+            organization = Organization.objects.get(id=organization_id)
+        except Organization.DoesNotExist:
+            raise serializers.ValidationError({"organization_id": "Organization not found."})
+        
+        # Create Coordinate and WasteBin instances
+        location = Coordinate.objects.create(**location_data)
+        waste_bin = WasteBin.objects.create(
+            location=location, 
+            organization=organization, 
+            **validated_data
+        )
         return waste_bin
 
     def update(self, instance, validated_data):
@@ -182,21 +229,40 @@ class RoomSerializer(serializers.ModelSerializer):
 
 
 class BoilerSerializer(serializers.ModelSerializer):
-    device_health = DeviceHealthSerializer()
-    connected_rooms = RoomSerializer(many=True)
+    device_health = DeviceHealthSerializer(required=False, allow_null=True)
+    connected_rooms = RoomSerializer(many=True, required=False)
+    target_humidity = serializers.IntegerField(required=False, allow_null=True)
 
     class Meta:
         model = Boiler
         fields = '__all__'
 
     def create(self, validated_data):
-        device_health_data = validated_data.pop('device_health')
+        device_health_data = validated_data.pop('device_health', None)
         connected_rooms_data = validated_data.pop('connected_rooms', [])
         
-        device_health = DeviceHealth.objects.create(**device_health_data)
+        # Set default target_humidity if not provided
+        if 'target_humidity' not in validated_data or validated_data.get('target_humidity') is None:
+            validated_data['target_humidity'] = 50
+        
+        # Create default device health if not provided
+        if device_health_data:
+            device_health = DeviceHealth.objects.create(**device_health_data)
+        else:
+            device_health = DeviceHealth.objects.create(
+                battery_level=100.0,
+                signal_strength=100.0,
+                last_ping=timezone.now(),
+                firmware_version='1.0.0',
+                is_online=True
+            )
+        
         boiler = Boiler.objects.create(device_health=device_health, **validated_data)
         
         for room_data in connected_rooms_data:
+            # Set default target_humidity for room if not provided
+            if 'target_humidity' not in room_data or room_data.get('target_humidity') is None:
+                room_data['target_humidity'] = 50
             room = Room.objects.create(**room_data)
             boiler.connected_rooms.add(room)
         
@@ -215,8 +281,33 @@ class BoilerSerializer(serializers.ModelSerializer):
         if connected_rooms_data is not None:
             instance.connected_rooms.clear()
             for room_data in connected_rooms_data:
-                room, created = Room.objects.get_or_create(**room_data)
+                # Set default target_humidity for room if not provided
+                if 'target_humidity' not in room_data or room_data.get('target_humidity') is None:
+                    room_data['target_humidity'] = 50
+                
+                # Handle room creation with all required fields
+                room_id = room_data.get('id')
+                if room_id:
+                    # If room has an ID, try to get or create it
+                    room, created = Room.objects.get_or_create(
+                        id=room_id,
+                        defaults=room_data
+                    )
+                    if not created:
+                        # Update existing room
+                        for attr, value in room_data.items():
+                            if attr != 'id':
+                                setattr(room, attr, value)
+                        room.save()
+                else:
+                    # Create new room
+                    room = Room.objects.create(**room_data)
                 instance.connected_rooms.add(room)
+
+        # Set default target_humidity if not provided in update
+        if 'target_humidity' not in validated_data or validated_data.get('target_humidity') is None:
+            if not hasattr(instance, 'target_humidity') or instance.target_humidity is None:
+                validated_data['target_humidity'] = 50
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -225,7 +316,7 @@ class BoilerSerializer(serializers.ModelSerializer):
 
 
 class FacilitySerializer(serializers.ModelSerializer):
-    boilers = BoilerSerializer(many=True)
+    boilers = BoilerSerializer(many=True, read_only=False)
 
     class Meta:
         model = Facility
@@ -236,9 +327,39 @@ class FacilitySerializer(serializers.ModelSerializer):
         facility = Facility.objects.create(**validated_data)
         
         for boiler_data in boilers_data:
+            # Extract connected_rooms from boiler_data
+            connected_rooms_data = boiler_data.pop('connected_rooms', [])
+            
+            # Create boiler without connected_rooms first
             boiler_serializer = BoilerSerializer(data=boiler_data)
             boiler_serializer.is_valid(raise_exception=True)
             boiler = boiler_serializer.save()
+            
+            # Now add connected_rooms to the boiler
+            for room_data in connected_rooms_data:
+                # Set default target_humidity for room if not provided
+                if 'target_humidity' not in room_data or room_data.get('target_humidity') is None:
+                    room_data['target_humidity'] = 50
+                
+                # Handle room creation with all required fields
+                room_id = room_data.get('id')
+                if room_id:
+                    # If room has an ID, try to get or create it
+                    room, created = Room.objects.get_or_create(
+                        id=room_id,
+                        defaults=room_data
+                    )
+                    if not created:
+                        # Update existing room
+                        for attr, value in room_data.items():
+                            if attr != 'id':
+                                setattr(room, attr, value)
+                        room.save()
+                else:
+                    # Create new room
+                    room = Room.objects.create(**room_data)
+                boiler.connected_rooms.add(room)
+            
             facility.boilers.add(boiler)
         
         return facility
@@ -247,12 +368,90 @@ class FacilitySerializer(serializers.ModelSerializer):
         boilers_data = validated_data.pop('boilers', None)
 
         if boilers_data is not None:
-            instance.boilers.clear()
+            # Get existing boiler IDs
+            existing_boiler_ids = set(instance.boilers.values_list('id', flat=True))
+            incoming_boiler_ids = set()
+            
             for boiler_data in boilers_data:
-                boiler_serializer = BoilerSerializer(data=boiler_data)
-                boiler_serializer.is_valid(raise_exception=True)
-                boiler = boiler_serializer.save()
-                instance.boilers.add(boiler)
+                boiler_id = boiler_data.get('id')
+                
+                # Extract connected_rooms from boiler_data
+                connected_rooms_data = boiler_data.pop('connected_rooms', [])
+                
+                if boiler_id and boiler_id in existing_boiler_ids:
+                    # Update existing boiler
+                    boiler = instance.boilers.get(id=boiler_id)
+                    boiler_serializer = BoilerSerializer(boiler, data=boiler_data, partial=True)
+                    boiler_serializer.is_valid(raise_exception=True)
+                    boiler = boiler_serializer.save()
+                    
+                    # Update connected rooms for this boiler
+                    boiler.connected_rooms.clear()
+                    for room_data in connected_rooms_data:
+                        # Set default target_humidity for room if not provided
+                        if 'target_humidity' not in room_data or room_data.get('target_humidity') is None:
+                            room_data['target_humidity'] = 50
+                        
+                        # Handle room creation with all required fields
+                        room_id = room_data.get('id')
+                        if room_id:
+                            # If room has an ID, try to get or create it
+                            room, created = Room.objects.get_or_create(
+                                id=room_id,
+                                defaults=room_data
+                            )
+                            if not created:
+                                # Update existing room
+                                for attr, value in room_data.items():
+                                    if attr != 'id':
+                                        setattr(room, attr, value)
+                                room.save()
+                        else:
+                            # Create new room
+                            room = Room.objects.create(**room_data)
+                        boiler.connected_rooms.add(room)
+                    
+                    incoming_boiler_ids.add(boiler_id)
+                else:
+                    # Create new boiler
+                    # Create boiler without connected_rooms first
+                    boiler_serializer = BoilerSerializer(data=boiler_data)
+                    boiler_serializer.is_valid(raise_exception=True)
+                    boiler = boiler_serializer.save()
+                    
+                    # Now add connected_rooms to the new boiler
+                    for room_data in connected_rooms_data:
+                        # Set default target_humidity for room if not provided
+                        if 'target_humidity' not in room_data or room_data.get('target_humidity') is None:
+                            room_data['target_humidity'] = 50
+                        
+                        # Handle room creation with all required fields
+                        room_id = room_data.get('id')
+                        if room_id:
+                            # If room has an ID, try to get or create it
+                            room, created = Room.objects.get_or_create(
+                                id=room_id,
+                                defaults=room_data
+                            )
+                            if not created:
+                                # Update existing room
+                                for attr, value in room_data.items():
+                                    if attr != 'id':
+                                        setattr(room, attr, value)
+                                room.save()
+                        else:
+                            # Create new room
+                            room = Room.objects.create(**room_data)
+                        boiler.connected_rooms.add(room)
+                    
+                    instance.boilers.add(boiler)
+                    if boiler_id:
+                        incoming_boiler_ids.add(boiler_id)
+            
+            # Remove boilers that are no longer in the incoming data
+            boilers_to_remove = existing_boiler_ids - incoming_boiler_ids
+            for boiler_id in boilers_to_remove:
+                instance.boilers.remove(boiler_id)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -476,6 +675,36 @@ class ReportEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = ReportEntry
         fields = '__all__'
+
+
+class IoTDeviceSerializer(serializers.ModelSerializer):
+    location = CoordinateSerializer()
+    
+    class Meta:
+        model = IoTDevice
+        fields = '__all__'
+    
+    def create(self, validated_data):
+        # Extract location data
+        location_data = validated_data.pop('location')
+        location = Coordinate.objects.create(**location_data)
+        
+        # Create the IoT device with the location
+        iot_device = IoTDevice.objects.create(location=location, **validated_data)
+        return iot_device
+    
+    def update(self, instance, validated_data):
+        location_data = validated_data.pop('location', None)
+        if location_data:
+            location = instance.location
+            for attr, value in location_data.items():
+                setattr(location, attr, value)
+            location.save()
+        
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
 
 
 class UtilityNodeSerializer(serializers.ModelSerializer):

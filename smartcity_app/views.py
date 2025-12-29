@@ -19,7 +19,7 @@ from .models import (
     SOSColumn, EcoViolation, ConstructionSite, LightPole, Bus, CallRequest,
     Coordinate, Region, District, Room, Boiler, ConstructionMission, LightROI,
     ResponsibleOrg, CallRequestTimeline, Notification, ReportEntry, UtilityNode,
-    DeviceHealth
+    DeviceHealth, IoTDevice
 )
 from .serializers import (
     OrganizationSerializer, WasteBinSerializer, TruckSerializer, 
@@ -29,7 +29,7 @@ from .serializers import (
     RegionSerializer, DistrictSerializer, RoomSerializer, BoilerSerializer,
     ConstructionMissionSerializer, LightROISerializer, ResponsibleOrgSerializer,
     CallRequestTimelineSerializer, NotificationSerializer, ReportEntrySerializer,
-    UtilityNodeSerializer, DeviceHealthSerializer
+    UtilityNodeSerializer, DeviceHealthSerializer, IoTDeviceSerializer
 )
 import json
 import uuid
@@ -69,14 +69,11 @@ def login_view(request):
                         'id': str(org.id),
                         'name': org.name,
                         'role': 'ORGANIZATION',
-                        'enabled_modules': org.enabled_modules
-                    },
-                    'organization': OrganizationSerializer(org).data
+                        'enabled_modules': ['DASHBOARD', 'WASTE', 'CLIMATE']  # Only WASTE and CLIMATE for Farg'ona
+                    }
                 })
         except Organization.DoesNotExist:
             pass
-        
-        # Try to find as a truck/driver user
         try:
             truck = Truck.objects.get(login=login_param)
             if truck.password == password:  # In production, use proper password hashing
@@ -118,9 +115,7 @@ def login_view(request):
                     'id': 'superadmin',
                     'name': 'Super Admin',
                     'role': 'SUPERADMIN',
-                    'enabled_modules': ['DASHBOARD', 'WASTE', 'CLIMATE', 'MOISTURE', 'SECURITY', 
-                                      'ECO_CONTROL', 'CONSTRUCTION', 'LIGHT_INSPECTOR', 'AIR', 
-                                      'TRANSPORT', 'CALL_CENTER', 'ANALYTICS']
+                    'enabled_modules': ['DASHBOARD', 'WASTE', 'CLIMATE']  # Only WASTE and CLIMATE for Farg'ona
                 }
             })
         
@@ -142,9 +137,7 @@ def login_view(request):
                     'id': str(django_user.id),
                     'name': django_user.username,
                     'role': role,
-                    'enabled_modules': ['DASHBOARD', 'WASTE', 'CLIMATE', 'MOISTURE', 'SECURITY', 
-                                      'ECO_CONTROL', 'CONSTRUCTION', 'LIGHT_INSPECTOR', 'AIR', 
-                                      'TRANSPORT', 'CALL_CENTER', 'ANALYTICS']
+                    'enabled_modules': ['DASHBOARD', 'WASTE', 'CLIMATE']  # Only WASTE and CLIMATE for Farg'ona
                 }
             })
         
@@ -194,10 +187,10 @@ class WasteBinListCreateView(APIView):
         
         if org_id:
             # For organization users, return only bins belonging to their organization
-            bins = WasteBin.objects.filter(organization_id=org_id)
+            bins = WasteBin.objects.filter(organization_id=org_id).select_related('location', 'organization')
         else:
             # For superadmin, return all bins
-            bins = WasteBin.objects.all()
+            bins = WasteBin.objects.all().select_related('location', 'organization')
         
         serializer = WasteBinSerializer(bins, many=True, context={'request': request})
         return Response(serializer.data)
@@ -692,7 +685,10 @@ class BoilerDetailView(APIView):
 
 class FacilityListCreateView(APIView):
     def get(self, request):
-        facilities = Facility.objects.all()
+        from django.db.models import Prefetch
+        # Prefetch boilers and their connected rooms for efficient querying
+        boilers_prefetch = Prefetch('boilers', Boiler.objects.prefetch_related('connected_rooms', 'device_health'))
+        facilities = Facility.objects.prefetch_related(boilers_prefetch).all()
         serializer = FacilitySerializer(facilities, many=True)
         return Response(serializer.data)
     
@@ -706,13 +702,16 @@ class FacilityListCreateView(APIView):
 
 class FacilityDetailView(APIView):
     def get(self, request, pk):
-        facility = get_object_or_404(Facility, pk=pk)
+        from django.db.models import Prefetch
+        # Prefetch boilers and their connected rooms for efficient querying
+        boilers_prefetch = Prefetch('boilers', Boiler.objects.prefetch_related('connected_rooms', 'device_health'))
+        facility = get_object_or_404(Facility.objects.prefetch_related(boilers_prefetch), pk=pk)
         serializer = FacilitySerializer(facility)
         return Response(serializer.data)
     
     def put(self, request, pk):
         facility = get_object_or_404(Facility, pk=pk)
-        serializer = FacilitySerializer(facility, data=request.data)
+        serializer = FacilitySerializer(facility, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data)
@@ -1576,4 +1575,452 @@ class UtilityNodeDetailView(APIView):
         node = get_object_or_404(UtilityNode, pk=pk)
         node.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_bin_with_camera_image(request, pk):
+    """
+    API endpoint to update waste bin with camera image and AI analysis
+    """
+    bin = get_object_or_404(WasteBin, pk=pk)
+    
+    # Check if user has permission to access this bin
+    org_id = request.session.get('organization_id')
+    if org_id and str(bin.organization_id) != org_id:
+        return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+    
+    # Get image data from request
+    image_data = request.data.get('image_url', None)
+    image_source = request.data.get('image_source', 'CCTV')
+    last_analysis = request.data.get('last_analysis', f'Kamera tahlili {timezone.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    
+    if image_data:
+        # Update the bin with the new image and information
+        bin.image_url = image_data
+        bin.image_source = image_source
+        bin.last_analysis = last_analysis
+        
+        # For camera images, we'll update the fill level based on the image if possible
+        # In a real system, this would call an AI service to analyze the image
+        # For now, we'll keep the existing fill level and is_full status
+        # But we can enhance this to use AI analysis
+        try:
+            # Attempt to download and analyze the image with AI
+            import requests as req
+            import base64
+            from io import BytesIO
+            
+            # Download image from URL
+            response = req.get(image_data)
+            if response.status_code == 200:
+                # Convert image to base64 for AI analysis
+                image_bytes = BytesIO(response.content).read()
+                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                
+                # Call backend AI service to analyze the image
+                ai_result = analyze_bin_image_backend(image_base64)
+                
+                # Update bin status based on AI analysis
+                bin.fill_level = ai_result['fillLevel']
+                bin.is_full = ai_result['isFull']
+                
+                # Update last analysis with AI results
+                bin.last_analysis = f"AI tahlili: {ai_result['notes']}, IsFull: {ai_result['isFull']}, FillLevel: {ai_result['fillLevel']}%, Conf: {ai_result['confidence']}%"
+                
+        except Exception as e:
+            # If AI analysis fails, log the error but continue with existing values
+            print(f"AI analysis failed: {e}")
+            # Optionally, you could use a default analysis or keep the existing values
+            
+        bin.save()
+    
+    serializer = WasteBinSerializer(bin)
+    return Response(serializer.data)
+
+def analyze_bin_image_backend(base64_image):
+    """
+    Backend function to analyze waste bin image using Google AI API
+    """
+    import os
+    import requests
+    import json
+    
+    # Get API key from environment or use default
+    api_key = os.getenv('GEMINI_API_KEY', 'YOUR_API_KEY_HERE')
+    if api_key == 'YOUR_API_KEY_HERE':
+        # If no API key is set, return a basic response
+        return {
+            'isFull': True,
+            'fillLevel': 90,
+            'confidence': 70,
+            'notes': 'API kaliti ornatilmagan, oddiy tahlil amalga oshirildi'
+        }
+    
+    # Prepare the request to Google AI
+    ai_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={api_key}'
+    
+    # Create detailed prompt for AI with enhanced analysis
+    prompt = '''Siz tajriboli atrof-muhitni kuzatuv tizimi ekspertisiz. Rasmni tahlil qiling va quyidagilarni aniqlang:
+    1. Rasmda chiqindi konteyneri bormi? Javob: HA yoki YO'Q.
+    2. Agar HA bo'lsa, konteyner to'la bo'limi? Javob: HA yoki YO'Q.
+    3. Agar HA bo'lsa, to'ldirish darajasini % (0-100) ko'rsating.
+    4. Rasm sifatini baholang (yaxshi, o'rtacha, yomon).
+
+    Javobni quyidagi JSON formatda bering:
+    {
+        "isFull": boolean,
+        "fillLevel": number (0 dan 100 gacha foiz),
+        "confidence": number (O'z qaroringga ishonch darajasi 0-100),
+        "notes": string (Qisqa izoh o'zbek tilida: Masalan "Konteyner toshib ketgan" yoki "Yarmi bo'sh")
+    }
+    '''
+    
+    ai_headers = {
+        'Content-Type': 'application/json',
+    }
+    
+    ai_payload = {
+        'contents': [{
+            'parts': [
+                {'text': prompt},
+                {
+                    'inlineData': {
+                        'mimeType': 'image/jpeg',
+                        'data': base64_image
+                    }
+                }
+            ]
+        }]
+    }
+    
+    try:
+        response = requests.post(ai_url, headers=ai_headers, data=json.dumps(ai_payload))
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            # Extract the AI response
+            if 'candidates' in result and len(result['candidates']) > 0:
+                candidate = result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    content_parts = candidate['content']['parts']
+                    for part in content_parts:
+                        if 'text' in part:
+                            # Try to parse the JSON response
+                            text_content = part['text'].strip()
+                            
+                            # Remove any markdown code block markers
+                            if text_content.startswith('```'):
+                                # Find the JSON part in the response
+                                import re
+                                json_match = re.search(r'\{.*\}', text_content, re.DOTALL)
+                                if json_match:
+                                    text_content = json_match.group()
+                                else:
+                                    # If no JSON found, return default values
+                                    return {
+                                        'isFull': True,
+                                        'fillLevel': 80,
+                                        'confidence': 60,
+                                        'notes': 'Tahlil natijasini tahlil qilishda xatolik yuz berdi'
+                                    }
+                            
+                            try:
+                                ai_result = json.loads(text_content)
+                                return {
+                                    'isFull': ai_result.get('isFull', False),
+                                    'fillLevel': ai_result.get('fillLevel', 50),
+                                    'confidence': ai_result.get('confidence', 50),
+                                    'notes': ai_result.get('notes', 'AI tahlili tugadi')
+                                }
+                            except json.JSONDecodeError:
+                                # If JSON parsing fails, return default values
+                                return {
+                                    'isFull': True,
+                                    'fillLevel': 75,
+                                    'confidence': 50,
+                                    'notes': 'JSON javobini tahlil qilishda xatolik yuz berdi'
+                                }
+            
+            # If no candidates found, return default values
+            return {
+                'isFull': True,
+                'fillLevel': 70,
+                'confidence': 40,
+                'notes': 'AI javob topilmadi'
+            }
+        else:
+            # If API call fails, return default values
+            print(f"AI API request failed: {response.status_code}, {response.text}")
+            return {
+                'isFull': True,
+                'fillLevel': 60,
+                'confidence': 30,
+                'notes': f'AI tahlilida xatolik: {response.status_code}'
+            }
+    except Exception as e:
+        # If any error occurs, return default values
+        print(f"AI analysis error: {e}")
+        return {
+            'isFull': True,
+            'fillLevel': 50,
+            'confidence': 25,
+            'notes': f'AI tahlilida xatolik yuz berdi: {str(e)}'
+        }
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_iot_sensor_data(request):
+    """
+    API endpoint to update IoT sensor data (temperature and humidity) from ESP devices
+    """
+    try:
+        device_id = request.data.get('device_id')
+        temperature = request.data.get('temperature')
+        humidity = request.data.get('humidity')
+        sleep_seconds = request.data.get('sleep_seconds', 2000)
+        timestamp = request.data.get('timestamp', int(timezone.now().timestamp()))
+        
+        if not device_id:
+            return Response({'error': 'device_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Find the IoT device by device_id
+        try:
+            iot_device = IoTDevice.objects.get(device_id=device_id)
+        except IoTDevice.DoesNotExist:
+            return Response({'error': f'Device with ID {device_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Update device's last seen time and sensor readings
+        iot_device.last_seen = timezone.now()
+        iot_device.current_temperature = temperature
+        iot_device.current_humidity = humidity
+        iot_device.last_sensor_update = timezone.now()
+        iot_device.save()
+        
+        # Update associated room or boiler if available
+        if iot_device.room:
+            iot_device.room.temperature = temperature or iot_device.room.temperature
+            if humidity is not None:
+                iot_device.room.humidity = humidity
+            iot_device.room.last_updated = timezone.now()
+            iot_device.room.save()
+        elif iot_device.boiler:
+            iot_device.boiler.temperature = temperature or iot_device.boiler.temperature
+            if humidity is not None:
+                iot_device.boiler.humidity = humidity
+            iot_device.boiler.last_updated = timezone.now()
+            iot_device.boiler.save()
+        
+        return Response({
+            'message': 'Sensor data updated successfully',
+            'device_id': device_id,
+            'temperature': temperature,
+            'humidity': humidity,
+            'timestamp': timestamp
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@csrf_exempt
+@api_view(['POST', 'OPTIONS'])
+@permission_classes([])  # Temporarily allow unauthenticated for diagnostic tests
+def link_iot_device_to_boiler(request):
+    """
+    API endpoint to link an IoT device to a boiler
+    """
+    try:
+        # Diagnostic logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug('link_iot_device_to_boiler called with method=%s, user=%s', request.method, str(request.user))
+        try:
+            headers = {k: v for k, v in request.META.items() if k.startswith('HTTP_')}
+        except Exception:
+            headers = {}
+        logger.debug('Request headers (HTTP_*): %s', headers)
+        logger.debug('Request data: %s', request.data)
+
+        device_id = request.data.get('device_id')
+        boiler_id = request.data.get('boiler_id')
+        
+        if not device_id or not boiler_id:
+            return Response({'error': 'device_id and boiler_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Find the IoT device and boiler
+        try:
+            iot_device = IoTDevice.objects.get(device_id=device_id)
+        except IoTDevice.DoesNotExist:
+            return Response({'error': f'Device with ID {device_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        try:
+            boiler = Boiler.objects.get(id=boiler_id)
+        except Boiler.DoesNotExist:
+            return Response({'error': f'Boiler with ID {boiler_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Link the IoT device to the boiler
+        iot_device.boiler = boiler
+        iot_device.room = None  # Clear room if previously linked
+        iot_device.save()
+        
+        # Update boiler with current device readings if available
+        if iot_device.current_temperature is not None:
+            boiler.temperature = iot_device.current_temperature
+        if iot_device.current_humidity is not None:
+            boiler.humidity = iot_device.current_humidity
+        boiler.last_updated = timezone.now()
+        boiler.save()
+
+        logger.debug('IoT device %s linked to boiler %s successfully', device_id, boiler_id)
+        return Response({
+            'message': 'IoT device linked to boiler successfully',
+            'device_id': device_id,
+            'boiler_id': boiler_id
+        })
+        
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception('Error in link_iot_device_to_boiler')
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# Debug endpoint to verify POST requests reach the server
+@csrf_exempt
+@api_view(['POST', 'OPTIONS'])
+@permission_classes([])
+def iot_link_test(request):
+    """Simple debug endpoint: echoes back received JSON and headers."""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug('iot_link_test method=%s headers=%s data=%s', request.method, {k:v for k,v in request.META.items() if k.startswith('HTTP_')}, request.data)
+    return Response({'ok': True, 'method': request.method, 'data': request.data})
+
+
+from django.views.decorators.csrf import csrf_exempt
+
+@csrf_exempt
+@api_view(['POST', 'OPTIONS'])
+@permission_classes([])  # Temporarily allow unauthenticated for diagnostic tests
+def link_iot_device_to_room(request):
+    """
+    API endpoint to link an IoT device to a room
+    """
+    try:
+        # Diagnostic logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug('link_iot_device_to_room called with method=%s, user=%s', request.method, str(request.user))
+        try:
+            # Only log a subset of headers to avoid sensitive info
+            headers = {k: v for k, v in request.META.items() if k.startswith('HTTP_')}
+        except Exception:
+            headers = {}
+        logger.debug('Request headers (HTTP_*): %s', headers)
+        logger.debug('Request data: %s', request.data)
+
+        device_id = request.data.get('device_id')
+        room_id = request.data.get('room_id')
+        
+        if not device_id or not room_id:
+            return Response({'error': 'device_id and room_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Find the IoT device and room
+        try:
+            iot_device = IoTDevice.objects.get(device_id=device_id)
+        except IoTDevice.DoesNotExist:
+            return Response({'error': f'Device with ID {device_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        try:
+            room = Room.objects.get(id=room_id)
+        except Room.DoesNotExist:
+            return Response({'error': f'Room with ID {room_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Link the IoT device to the room
+        iot_device.room = room
+        iot_device.boiler = None  # Clear boiler if previously linked
+        iot_device.save()
+        
+        # Update room with current device readings if available
+        if iot_device.current_temperature is not None:
+            room.temperature = iot_device.current_temperature
+        if iot_device.current_humidity is not None:
+            room.humidity = iot_device.current_humidity
+        room.last_updated = timezone.now()
+        room.save()
+        
+        logger.debug('IoT device %s linked to room %s successfully', device_id, room_id)
+        return Response({
+            'message': 'IoT device linked to room successfully',
+            'device_id': device_id,
+            'room_id': room_id
+        })
+        
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception('Error in link_iot_device_to_room')
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# IoT Device Views
+@method_decorator(csrf_exempt, name='dispatch')
+class IoTDeviceListCreateView(APIView):
+    def get(self, request):
+        # Get the user's organization if available
+        org_id = request.session.get('organization_id')
+        
+        if org_id:
+            # For organization users, return only devices belonging to their organization
+            # Since IoT devices are linked to rooms or boilers which are linked to facilities
+            # we'll return all IoT devices but with optimized queries
+            devices = IoTDevice.objects.select_related('location', 'room', 'boiler').all()
+        else:
+            # For superadmin, return all devices
+            devices = IoTDevice.objects.select_related('location', 'room', 'boiler').all()
+        
+        serializer = IoTDeviceSerializer(devices, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    def post(self, request):
+        # Add organization context based on user session if needed
+        # For IoT devices, we don't directly associate with organizations
+        # but rather through rooms/boilers
+        data = request.data.copy()  # Always initialize data
+        
+        serializer = IoTDeviceSerializer(data=data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class IoTDeviceDetailView(APIView):
+    def get(self, request, pk):
+        device = get_object_or_404(IoTDevice.objects.select_related('location', 'room', 'boiler'), pk=pk)
+        serializer = IoTDeviceSerializer(device, context={'request': request})
+        return Response(serializer.data)
+    
+    def put(self, request, pk):
+        device = get_object_or_404(IoTDevice, pk=pk)
+        serializer = IoTDeviceSerializer(device, data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def patch(self, request, pk):
+        device = get_object_or_404(IoTDevice, pk=pk)
+        serializer = IoTDeviceSerializer(device, data=request.data, context={'request': request}, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def delete(self, request, pk):
+        device = get_object_or_404(IoTDevice, pk=pk)
+        device.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 

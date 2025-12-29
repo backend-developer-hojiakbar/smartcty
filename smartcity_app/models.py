@@ -103,9 +103,27 @@ class WasteBin(models.Model):
     image_source = models.CharField(max_length=20, default='CCTV')
     is_full = models.BooleanField(default=False)
     device_health = models.JSONField(default=dict)
+    qr_code_url = models.URLField(blank=True, null=True)
+
+
+class IoTDevice(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    device_id = models.CharField(max_length=100, unique=True)  # ESP-A4C416
+    device_type = models.CharField(max_length=50, choices=[('TEMPERATURE_SENSOR', 'Temperature Sensor'), ('HUMIDITY_SENSOR', 'Humidity Sensor'), ('BOTH', 'Temperature and Humidity Sensor')])
+    room = models.ForeignKey('Room', on_delete=models.CASCADE, null=True, blank=True, related_name='iot_devices')
+    boiler = models.ForeignKey('Boiler', on_delete=models.CASCADE, null=True, blank=True, related_name='iot_devices')
+    location = models.OneToOneField(Coordinate, on_delete=models.CASCADE)
+    last_seen = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    # Current sensor readings
+    current_temperature = models.FloatField(null=True, blank=True)
+    current_humidity = models.FloatField(null=True, blank=True)
+    last_sensor_update = models.DateTimeField(null=True, blank=True)
     
     def __str__(self):
-        return f"Bin at {self.address}"
+        return f"{self.device_id} - {self.device_type}"
 
 
 class Truck(models.Model):
@@ -149,32 +167,6 @@ class MoistureSensor(models.Model):
         return f"Moisture Sensor {self.mfy}"
 
 
-class Room(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=100)
-    target_humidity = models.FloatField()
-    humidity = models.FloatField()
-    status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
-    trend = models.JSONField()  # Stores humidity trend as a list of values
-
-    def __str__(self):
-        return self.name
-
-
-class Boiler(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=100)
-    target_humidity = models.FloatField()
-    humidity = models.FloatField()
-    status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
-    trend = models.JSONField()  # Stores humidity trend as a list of values
-    device_health = models.OneToOneField(DeviceHealth, on_delete=models.CASCADE, related_name='boiler_health')
-    connected_rooms = models.ManyToManyField(Room, related_name='boilers')
-
-    def __str__(self):
-        return self.name
-
-
 class Facility(models.Model):
     FACILITY_TYPE_CHOICES = [
         ('SCHOOL', 'School'),
@@ -192,7 +184,47 @@ class Facility(models.Model):
     manager_name = models.CharField(max_length=100)
     last_maintenance = models.DateTimeField()
     history = models.JSONField()  # Stores history as a list of values
-    boilers = models.ManyToManyField(Boiler, related_name='facilities')
+    boilers = models.ManyToManyField('Boiler', related_name='facilities')
+
+    def __str__(self):
+        return self.name
+
+
+class Room(models.Model):
+    # ID field changed to CharField to support custom IDs like "0420101" (preserves leading zeros)
+    id = models.CharField(primary_key=True, max_length=50, unique=True, editable=True, 
+                         help_text="Room ID (e.g., 0420101 - leading zeros are preserved)")
+    name = models.CharField(max_length=100)
+    facility = models.ForeignKey(Facility, on_delete=models.CASCADE, related_name='rooms', null=True, blank=True)
+    floor = models.IntegerField(null=True, blank=True)
+    capacity = models.IntegerField(null=True, blank=True)
+    is_occupied = models.BooleanField(default=False)
+    target_humidity = models.FloatField()
+    humidity = models.FloatField()
+    temperature = models.FloatField(default=22.0)  # Added temperature field
+    status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
+    trend = models.JSONField()  # Stores humidity trend as a list of values
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    last_updated = models.DateTimeField(auto_now=True, null=True)
+
+    def __str__(self):
+        if self.facility:
+            return f"{self.name} ({self.id}) - {self.facility.name}"
+        return f"{self.name} ({self.id})"
+
+
+class Boiler(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100)
+    target_humidity = models.FloatField()
+    humidity = models.FloatField()
+    temperature = models.FloatField(default=22.0)  # Added temperature field
+    status = models.CharField(max_length=20, choices=MoistureSensor.SENSOR_STATUS_CHOICES)
+    trend = models.JSONField()  # Stores humidity trend as a list of values
+    device_health = models.OneToOneField(DeviceHealth, on_delete=models.CASCADE, related_name='boiler_health')
+    connected_rooms = models.ManyToManyField(Room, related_name='boilers')
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    last_updated = models.DateTimeField(auto_now=True, null=True)
 
     def __str__(self):
         return self.name
